@@ -5,6 +5,7 @@ using Polee
 using Polee.PoleeModel
 using Flux
 using HDF5
+import CUDA
 import ProgressMeter
 
 const device = Flux.gpu
@@ -18,7 +19,7 @@ const nepochs = 200
 Generic transformation applid to expression vectors. This seems to make
 training easier.
 """
-expr_trans(x) = log.(x) .- log(1/size(x, 1))
+expr_trans(x) = log.(x) .- log(1f0/size(x, 1))
 
 sqnorm(ws) = sum(abs2, ws)
 
@@ -338,8 +339,6 @@ function eval(model::Classifier{PTTBetaParams}, eval_spec::Dict)
 end
 
 
-# TODO: Figure out how to set up a sampler as the input to the model. Probably
-# a custom training loop is the easiest way to pull that off.
 struct PTTLatentExpr <: QuantMethod
     t::Polee.PolyaTreeTransform
     neval_samples::Int
@@ -381,38 +380,43 @@ function load_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
 end
 
 
+function cuda_approx_sample(t::Polee.PolyaTreeTransform, μ, σ, α)
+    n = size(μ, 1) + 1
+    m = size(μ, 2)
+    z0 = CUDA.randn(size(μ)...)
+    z = CUDA.sinh.(CUDA.asinh.(z0) .+ α) # sinh-asinh transform
+    y = CUDA.inv.(CUDA.exp.(.-(μ .+ z .* σ)) .+ 1f0) # logit normal transform
 
-# function cuda_approx_sample(t::Polee.PolyaTreeTransform, μ, σ, α)
-#     n = size(μ, 1) + 1
-#     m = size(μ, 2)
-#     z0 = CUDA.randn(size(μ))
-#     z = CUDA.sinh(CUDA.asinh.(z0) .+ α) # sinh-asinh transform
-#     y = CUDA.inv.(CUDA.exp(.-(μ .+ z .* σ)) .+ 1f0) # logit normal transform
+    # polya tree transformation
 
-#     # polya tree transformation
+    # TODO: does seem like the part below is the really slow part
+    # Not really sure how to make it faster. In the past we tried a series
+    # of sparse matrix multiplies. Would that be better? Is there a way to
+    # avoid allocating so many intermediate arrays?
 
-#     u = CUDA.zeros(Float64, 2*n-1, m) # intermediate values
-#     x = CUDA.zeros(n, m) # output values
-#     k = 1 # internal node count
-#     for i in 1:2n-1
-#         output_idx = t.index[1, i]
-#         if output_idx != 0
-#             x[output_idx,:] = u[i,:]
-#             continue
-#         end
+    u = CUDA.zeros(Float64, 2*n-1, m) # intermediate values
+    x = CUDA.zeros(n, m) # output values
+    k = 1 # internal node count
+    for i in 1:2n-1
+        output_idx = t.index[1, i]
+        if output_idx != 0
+            x[output_idx,:] .= u[i,:]
+            continue
+        end
 
-#         left_idx = t.index[2, i]
-#         right_idx = t.index[3, i]
+        left_idx = t.index[2, i]
+        right_idx = t.index[3, i]
 
-#         us[left_idx,:] = y[k,:] .* us[i,:]
-#         us[right_idx,:] = (1.0 .- y[k,:]) .* us[i,:]
+        u_i = u[i,:]
+        v = y[k,:] .* u_i
+        u[left_idx,:] .= max.(v, 1e-16)
+        u[right_idx,:] .= max.(u_i .- v, 1e-16)
 
-#         k += 1
-#     end
+        k += 1
+    end
 
-#     return x
-# end
-
+    return x
+end
 
 
 function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
@@ -426,9 +430,9 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
     model.classes = get_classes(train_spec, model.factor)
     μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
 
-    train_data_loader = Flux.Data.DataLoader(
+    train_data_loader = device.(Flux.Data.DataLoader(
         μs, σs, αs, train_classes,
-        batchsize=batchsize, shuffle=true)
+        batchsize=batchsize, shuffle=true))
 
     n = size(μs, 1) + 1
     n_out = length(model.classes)
@@ -439,14 +443,17 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
     function total_loss()
         l = 0f0
         for (μ, σ, α, y) in train_data_loader
-            x = Array{Float32}(undef, (n, size(μ, 2)))
-            for i in 1:size(μ, 2)
-                Polee.set_transform!(als, model.quant.t, μ[:,i], σ[:,i], α[:,i])
-                Polee.rand!(als, @view x[:,i])
-            end
-            l += Flux.Losses.logitcrossentropy(
-                model.layers(device(expr_trans(x))),
-                device(y))
+            # x = Array{Float32}(undef, (n, size(μ, 2)))
+            # for i in 1:size(μ, 2)
+            #     Polee.set_transform!(als, model.quant.t, μ[:,i], σ[:,i], α[:,i])
+            #     Polee.rand!(als, @view x[:,i])
+            # end
+            # l += Flux.Losses.logitcrossentropy(
+            #     model.layers(device(expr_trans(x))),
+            #     device(y))
+
+            x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
+            l += Flux.Losses.logitcrossentropy(model.layers(x), y)
         end
         return l / length(train_data_loader)
     end
@@ -459,15 +466,18 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
     for epoch in 1:nepochs
         ps = params(model.layers)
         for (μ, σ, α, y) in train_data_loader
-            x = Array{Float32}(undef, (n, size(μ, 2)))
-            for i in 1:size(μ, 2)
-                Polee.set_transform!(als, model.quant.t, μ[:,i], σ[:,i], α[:,i])
-                Polee.rand!(als, @view x[:,i])
-            end
-            x_gpu = device(expr_trans(x))
-            y_gpu = device(y)
+            # x = Array{Float32}(undef, (n, size(μ, 2)))
+            # for i in 1:size(μ, 2)
+            #     Polee.set_transform!(als, model.quant.t, μ[:,i], σ[:,i], α[:,i])
+            #     Polee.rand!(als, @view x[:,i])
+            # end
+            # x_gpu = device(expr_trans(x))
+            # y_gpu = device(y)
+
+            x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
+
             gs = gradient(ps) do
-                return loss(x_gpu, y_gpu)
+                return loss(x, y)
             end
             Flux.update!(opt, ps, gs)
         end
@@ -481,9 +491,10 @@ function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict)
 
     μs, σs, αs, eval_classes = load_pttlatent_data(model, eval_spec)
     eval_data_loader = Flux.Data.DataLoader(
-        μs, σs, αs, eval_classes)
+        μs, σs, αs, eval_classes, batchsize=batchsize)
 
     n = size(μs, 1) + 1
+    m = size(μs, 2)
     x = Vector{Float32}(undef, n)
     als = Polee.ApproxLikelihoodSampler()
 
@@ -491,18 +502,22 @@ function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict)
     total_count = 0
     pred = zeros(Float32, length(model.classes))
     for (μ, σ, α, y) in eval_data_loader
-        @assert size(μ, 2) == 1
-        Polee.set_transform!(als, model.quant.t, μ[:,1], σ[:,1], α[:,1])
-        for i in 1:model.quant.neval_samples
-            Polee.rand!(als, x)
-            pred .+= Flux.softmax(cpu(model.layers(device(expr_trans(x)))))
-        end
-        pred /= model.quant.neval_samples
-        acc += Flux.onecold(pred) == Flux.onecold(y[:,1])
-        total_count += 1
+        x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
+        pred = model.layers(x)
+        acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
+
+        # @assert size(μ, 2) == 1
+        # Polee.set_transform!(als, model.quant.t, μ[:,1], σ[:,1], α[:,1])
+        # for i in 1:model.quant.neval_samples
+        #     Polee.rand!(als, x)
+        #     pred .+= Flux.softmax(cpu(model.layers(device(expr_trans(x)))))
+        # end
+        # pred /= model.quant.neval_samples
+        # acc += Flux.onecold(pred) == Flux.onecold(y[:,1])
+        # total_count += 1
     end
 
-    acc /= total_count
+    acc /= m
     return acc
 end
 
