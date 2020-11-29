@@ -394,27 +394,48 @@ function cuda_approx_sample(t::Polee.PolyaTreeTransform, μ, σ, α)
     # of sparse matrix multiplies. Would that be better? Is there a way to
     # avoid allocating so many intermediate arrays?
 
-    u = CUDA.zeros(Float64, 2*n-1, m) # intermediate values
+    # u = CUDA.zeros(Float64, 2*n-1, m) # intermediate values
+
+    # this way we can avoid copying rows
+    us = [CUDA.zeros(Float64, m) for _ in 1:2*n-1]
+    # us = Array{CUDA.CuVector{Float64}}(undef, 2*n-1)
+    us[1] .= CUDA.ones(Float64, m)
+
     x = CUDA.zeros(n, m) # output values
     k = 1 # internal node count
     for i in 1:2n-1
+        @show i
+        u_i = us[i]
         output_idx = t.index[1, i]
         if output_idx != 0
-            x[output_idx,:] .= u[i,:]
+            # TODO: would it just be faster to do a big hcat?
+            x[output_idx,:] .= u_i
             continue
         end
 
         left_idx = t.index[2, i]
         right_idx = t.index[3, i]
 
-        u_i = u[i,:]
         v = y[k,:] .* u_i
-        u[left_idx,:] .= max.(v, 1e-16)
-        u[right_idx,:] .= max.(u_i .- v, 1e-16)
+
+        # TODO: Can we drop these max statements?
+        us[left_idx] .= max.(v, 1e-16)
+        us[right_idx] .= max.(u_i .- v, 1e-16)
 
         k += 1
     end
 
+    return x
+end
+
+
+function approx_sample(t::Polee.PolyaTreeTransform, als::Vector{Polee.ApproxLikelihoodSampler}, μ, σ, α)
+    n = size(μ, 1) + 1
+    x = Array{Float32}(undef, (n, size(μ, 2)))
+    Threads.@threads for i in 1:size(μ, 2)
+        Polee.set_transform!(als, t, μ[:,i], σ[:,i], α[:,i])
+        Polee.rand!(als, @view x[:,i])
+    end
     return x
 end
 
@@ -431,14 +452,15 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
     μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
 
     train_data_loader = device.(Flux.Data.DataLoader(
-        μs, σs, αs, train_classes,
+        μs, σs, αs,
+        train_classes,
         batchsize=batchsize, shuffle=true))
 
     n = size(μs, 1) + 1
     n_out = length(model.classes)
     model.layers = device(build_model(n, n_out))
 
-    als = Polee.ApproxLikelihoodSampler()
+    als = [Polee.ApproxLikelihoodSampler() for _ in 1:batchsize]
 
     function total_loss()
         l = 0f0
@@ -451,6 +473,9 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
             # l += Flux.Losses.logitcrossentropy(
             #     model.layers(device(expr_trans(x))),
             #     device(y))
+
+            # x = expr_trans(approx_sample(model.quant.t, als, μ, σ, α))
+            # l += Flux.Losses.logitcrossentropy(model.layers(device(x)), y)
 
             x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
             l += Flux.Losses.logitcrossentropy(model.layers(x), y)
@@ -476,6 +501,8 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
 
             x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
 
+            # x = expr_trans(approx_sample(model.quant.t, als, μ, σ, α))
+
             gs = gradient(ps) do
                 return loss(x, y)
             end
@@ -496,12 +523,14 @@ function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict)
     n = size(μs, 1) + 1
     m = size(μs, 2)
     x = Vector{Float32}(undef, n)
-    als = Polee.ApproxLikelihoodSampler()
+    # als = Polee.ApproxLikelihoodSampler()
+    als = [Polee.ApproxLikelihoodSampler() for _ in 1:batchsize]
 
     acc = 0.0
     total_count = 0
     pred = zeros(Float32, length(model.classes))
     for (μ, σ, α, y) in eval_data_loader
+        # x = expr_trans(approx_sample(model.quant.t, als, μ, σ, α))
         x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
         pred = model.layers(x)
         acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
