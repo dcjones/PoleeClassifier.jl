@@ -5,18 +5,31 @@ using Polee
 using Polee.PoleeModel
 using Flux
 using HDF5
-using ProgressMeter
+import ProgressMeter
 
 const device = Flux.gpu
 # const device = Flux.cpu
 
 const batchsize = 50
-const nepochs = 1000
+# const nepochs = 1000
+const nepochs = 200
+
+"""
+Generic transformation applid to expression vectors. This seems to make
+training easier.
+"""
+expr_trans(x) = log.(x) .- log(1/size(x, 1))
+
+sqnorm(ws) = sum(abs2, ws)
 
 # Different ways of approaching quantification each with a different take
 # on training the clasifier
 abstract type QuantMethod end
 
+"""
+Simple nn classifier that tries to learn some feature (e.g. tissue) from
+expression, where how quantification is handled depends on QuantMethod.
+"""
 mutable struct Classifier{T <: QuantMethod}
     quant::T
     layers::Union{Chain, Nothing}
@@ -25,6 +38,9 @@ mutable struct Classifier{T <: QuantMethod}
 end
 
 
+"""
+Plain old point estimates.
+"""
 struct PointEstimate <: QuantMethod
     ts::Polee.Transcripts
     ts_metadata::Polee.TranscriptsMetadata
@@ -32,6 +48,9 @@ struct PointEstimate <: QuantMethod
 end
 
 
+"""
+Collect an array of unique classes from the specification for the given factor.
+"""
 function get_classes(spec::Dict, factor::String)
     classes = Set{String}()
     for sample in spec["samples"]
@@ -42,17 +61,17 @@ end
 
 
 """
-Construct what will be our standard classifier given input and output size.
+Construct what will be our standard classifier nn given input and output size.
 """
 function build_model(n_in::Int, n_out::Int)
     initW = (dims...) -> 1e-3 * randn(Float32, dims...)
     M = 50
     return Chain(
         Dense(n_in, M, leakyrelu, initW=initW),
-        Dropout(0.25, M),
+        # Dropout(0.25, M),
         Dense(M, M, leakyrelu, initW=initW),
-        Dropout(0.25, M),
-        Dense(M, M, leakyrelu, initW=initW),
+        # Dropout(0.25, M),
+        # Dense(M, M, leakyrelu, initW=initW),
         Dense(M, n_out, initW=initW))
 end
 
@@ -69,11 +88,11 @@ function fit!(model::Classifier{PointEstimate}, train_spec::Dict)
     model.layers = device(build_model(length(model.quant.ts), length(model.classes)))
 
     num_samples, n = size(train_data.x0_values)
-    train_expr = Array(transpose(log.(train_data.x0_values))) .- log(1/n)
+    train_expr = expr_trans(Array(transpose(train_data.x0_values)))
     train_classes = hcat(
         [Flux.onehot(sample["factors"][model.factor], model.classes)
          for sample in train_spec["samples"]]...)
-jj
+
     train_data_loader = device.(Flux.Data.DataLoader(
         train_expr, train_classes,
         batchsize=batchsize, shuffle=true))
@@ -106,7 +125,7 @@ function eval(model::Classifier{PointEstimate}, eval_spec::Dict)
         model.quant.point_estimate)
 
     num_samples, n = size(eval_data.x0_values)
-    eval_expr = Array(transpose(log.(eval_data.x0_values))) .- log(1/n)
+    eval_expr = expr_trans(Array(transpose(eval_data.x0_values)))
 
     acc = 0.0
     for i in 1:num_samples
@@ -165,7 +184,7 @@ function load_kallisto_bootstap(model::Classifier{KallistoBootstrap}, spec::Dict
         close(input)
     end
 
-    expr_data = Array(transpose(log.(vcat(expr_data_vecs...)))) .- log(1/n)
+    expr_data = expr_trans(Array(transpose(vcat(expr_data_vecs...))))
     class_data_vecs = hcat(class_data_vecs...)
 
     return expr_data, class_data_vecs
@@ -234,7 +253,7 @@ function eval(model::Classifier{KallistoBootstrap}, eval_spec::Dict)
                 bootstrap_counts, efflens, model.quant.pseudocount,
                 transcript_ids, transcript_idx)
 
-            pred .+= cpu(model.layers(device(log.(bs[1,:]) .- log(1/n))))
+            pred .+= cpu(model.layers(device(expr_trans(bs[1,:]))))
             boot_count += 1
         end
         pred ./= boot_count
@@ -270,6 +289,8 @@ end
 
 
 function fit!(model::Classifier{PTTBetaParams}, train_spec::Dict)
+    # TODO: one issue with this approach is that we have no way of using
+    # effective length.
 
     model.classes = get_classes(train_spec, model.factor)
     train_approx, train_classes = load_beta_params(model, train_spec)
@@ -319,7 +340,171 @@ end
 
 # TODO: Figure out how to set up a sampler as the input to the model. Probably
 # a custom training loop is the easiest way to pull that off.
-struct PTTLatentExpr <: QuantMethod end
+struct PTTLatentExpr <: QuantMethod
+    t::Polee.PolyaTreeTransform
+    neval_samples::Int
+end
+
+
+function PTTLatentExpr(ptt_filename::String, neval_samples::Int)
+    input = h5open(ptt_filename)
+    t = Polee.PolyaTreeTransform(
+        read(input["node_parent_idxs"]),
+        read(input["node_js"]))
+    close(input)
+    return PTTLatentExpr(t, neval_samples)
+end
+
+
+function load_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
+    μ_vecs = Vector{Float32}[]
+    σ_vecs = Vector{Float32}[]
+    α_vecs = Vector{Float32}[]
+
+    for sample in spec["samples"]
+        input = h5open(sample["file"])
+        push!(μ_vecs, read(input["mu"]))
+        push!(σ_vecs, exp.(read(input["omega"])))
+        push!(α_vecs, read(input["alpha"]))
+        close(input)
+    end
+
+    train_classes = hcat(
+        [Flux.onehot(sample["factors"][model.factor], model.classes)
+         for sample in spec["samples"]]...)
+
+    μs = hcat(μ_vecs...)
+    σs = hcat(σ_vecs...)
+    αs = hcat(α_vecs...)
+
+    return μs, σs, αs, train_classes
+end
+
+
+
+# function cuda_approx_sample(t::Polee.PolyaTreeTransform, μ, σ, α)
+#     n = size(μ, 1) + 1
+#     m = size(μ, 2)
+#     z0 = CUDA.randn(size(μ))
+#     z = CUDA.sinh(CUDA.asinh.(z0) .+ α) # sinh-asinh transform
+#     y = CUDA.inv.(CUDA.exp(.-(μ .+ z .* σ)) .+ 1f0) # logit normal transform
+
+#     # polya tree transformation
+
+#     u = CUDA.zeros(Float64, 2*n-1, m) # intermediate values
+#     x = CUDA.zeros(n, m) # output values
+#     k = 1 # internal node count
+#     for i in 1:2n-1
+#         output_idx = t.index[1, i]
+#         if output_idx != 0
+#             x[output_idx,:] = u[i,:]
+#             continue
+#         end
+
+#         left_idx = t.index[2, i]
+#         right_idx = t.index[3, i]
+
+#         us[left_idx,:] = y[k,:] .* us[i,:]
+#         us[right_idx,:] = (1.0 .- y[k,:]) .* us[i,:]
+
+#         k += 1
+#     end
+
+#     return x
+# end
+
+
+
+function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
+    # Just going to assume logit-skew-normal approx here. May need
+    # to generalize in the future if we start using beta approx.
+
+    # TODO: This is insanely slow. I think computing samples on the cpu then
+    # transferring to the gpu may be a big bottleneck. We should be able to
+    # use CUDA.jl to build a gpu ptt implementation.
+
+    model.classes = get_classes(train_spec, model.factor)
+    μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
+
+    train_data_loader = Flux.Data.DataLoader(
+        μs, σs, αs, train_classes,
+        batchsize=batchsize, shuffle=true)
+
+    n = size(μs, 1) + 1
+    n_out = length(model.classes)
+    model.layers = device(build_model(n, n_out))
+
+    als = Polee.ApproxLikelihoodSampler()
+
+    function total_loss()
+        l = 0f0
+        for (μ, σ, α, y) in train_data_loader
+            x = Array{Float32}(undef, (n, size(μ, 2)))
+            for i in 1:size(μ, 2)
+                Polee.set_transform!(als, model.quant.t, μ[:,i], σ[:,i], α[:,i])
+                Polee.rand!(als, @view x[:,i])
+            end
+            l += Flux.Losses.logitcrossentropy(
+                model.layers(device(expr_trans(x))),
+                device(y))
+        end
+        return l / length(train_data_loader)
+    end
+
+    loss = (x, y) -> Flux.Losses.logitcrossentropy(model.layers(x), y)
+
+    # custom training loop that handles drawing samples
+    opt = ADAM()
+    prog = ProgressMeter.Progress(nepochs, desc="training: ")
+    for epoch in 1:nepochs
+        ps = params(model.layers)
+        for (μ, σ, α, y) in train_data_loader
+            x = Array{Float32}(undef, (n, size(μ, 2)))
+            for i in 1:size(μ, 2)
+                Polee.set_transform!(als, model.quant.t, μ[:,i], σ[:,i], α[:,i])
+                Polee.rand!(als, @view x[:,i])
+            end
+            x_gpu = device(expr_trans(x))
+            y_gpu = device(y)
+            gs = gradient(ps) do
+                return loss(x_gpu, y_gpu)
+            end
+            Flux.update!(opt, ps, gs)
+        end
+        ProgressMeter.next!(prog, showvalues = [(:loss, total_loss())])
+    end
+end
+
+
+function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict)
+    Flux.testmode!(model.layers)
+
+    μs, σs, αs, eval_classes = load_pttlatent_data(model, eval_spec)
+    eval_data_loader = Flux.Data.DataLoader(
+        μs, σs, αs, eval_classes)
+
+    n = size(μs, 1) + 1
+    x = Vector{Float32}(undef, n)
+    als = Polee.ApproxLikelihoodSampler()
+
+    acc = 0.0
+    total_count = 0
+    pred = zeros(Float32, length(model.classes))
+    for (μ, σ, α, y) in eval_data_loader
+        @assert size(μ, 2) == 1
+        Polee.set_transform!(als, model.quant.t, μ[:,1], σ[:,1], α[:,1])
+        for i in 1:model.quant.neval_samples
+            Polee.rand!(als, x)
+            pred .+= Flux.softmax(cpu(model.layers(device(expr_trans(x)))))
+        end
+        pred /= model.quant.neval_samples
+        acc += Flux.onecold(pred) == Flux.onecold(y[:,1])
+        total_count += 1
+    end
+
+    acc /= total_count
+    return acc
+end
 
 
 end # module PoleeClassifier
