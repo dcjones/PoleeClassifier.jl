@@ -1,0 +1,8 @@
+name = "PoleeClassifier"
+uuid = "e1600eae-933b-4b2e-9360-d7145c2ea9e7"
+authors = ["Daniel C. Jones <dcjones@cs.washington.edu>"]
+version = "0.1.0"
+
+[deps]
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+Polee = "974e64c6-83a9-11e8-1529-590dfc5f6343"
