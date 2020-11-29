@@ -433,8 +433,8 @@ function approx_sample(t::Polee.PolyaTreeTransform, als::Vector{Polee.ApproxLike
     n = size(μ, 1) + 1
     x = Array{Float32}(undef, (n, size(μ, 2)))
     Threads.@threads for i in 1:size(μ, 2)
-        Polee.set_transform!(als, t, μ[:,i], σ[:,i], α[:,i])
-        Polee.rand!(als, @view x[:,i])
+        Polee.set_transform!(als[i], t, μ[:,i], σ[:,i], α[:,i])
+        Polee.rand!(als[i], @view x[:,i])
     end
     return x
 end
@@ -451,10 +451,10 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
     model.classes = get_classes(train_spec, model.factor)
     μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
 
-    train_data_loader = device.(Flux.Data.DataLoader(
+    train_data_loader = Flux.Data.DataLoader(
         μs, σs, αs,
-        train_classes,
-        batchsize=batchsize, shuffle=true))
+        device(train_classes),
+        batchsize=batchsize, shuffle=true)
 
     n = size(μs, 1) + 1
     n_out = length(model.classes)
@@ -474,11 +474,11 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
             #     model.layers(device(expr_trans(x))),
             #     device(y))
 
-            # x = expr_trans(approx_sample(model.quant.t, als, μ, σ, α))
-            # l += Flux.Losses.logitcrossentropy(model.layers(device(x)), y)
-
-            x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
+            x = expr_trans(device(approx_sample(model.quant.t, als, μ, σ, α)))
             l += Flux.Losses.logitcrossentropy(model.layers(x), y)
+
+            # x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
+            # l += Flux.Losses.logitcrossentropy(model.layers(x), y)
         end
         return l / length(train_data_loader)
     end
@@ -499,9 +499,9 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
             # x_gpu = device(expr_trans(x))
             # y_gpu = device(y)
 
-            x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
+            # x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
 
-            # x = expr_trans(approx_sample(model.quant.t, als, μ, σ, α))
+            x = expr_trans(device(approx_sample(model.quant.t, als, μ, σ, α)))
 
             gs = gradient(ps) do
                 return loss(x, y)
@@ -530,9 +530,12 @@ function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict)
     total_count = 0
     pred = zeros(Float32, length(model.classes))
     for (μ, σ, α, y) in eval_data_loader
-        # x = expr_trans(approx_sample(model.quant.t, als, μ, σ, α))
-        x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
-        pred = model.layers(x)
+        x = expr_trans(device(approx_sample(model.quant.t, als, μ, σ, α)))
+
+        # x = expr_trans(cuda_approx_sample(model.quant.t, μ, σ, α))
+
+        pred = cpu(model.layers(x))
+
         acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
 
         # @assert size(μ, 2) == 1
