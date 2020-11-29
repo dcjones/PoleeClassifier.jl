@@ -4,10 +4,10 @@ module PoleeClassifier
 using Polee
 using Polee.PoleeModel
 using Flux
+using HDF5
 
 const device = Flux.gpu
 # const device = Flux.cpu
-
 
 # Different ways of approaching quantification each with a different take
 # on training the clasifier
@@ -66,7 +66,7 @@ function fit!(model::Classifier{PointEstimate}, train_spec::Dict)
     train_classes = hcat(
         [Flux.onehot(sample["factors"][model.factor], model.classes)
          for sample in train_spec["samples"]]...)
-
+jj
     train_data_loader = device.(Flux.Data.DataLoader(
         train_expr, train_classes,
         batchsize=50, shuffle=true))
@@ -78,8 +78,6 @@ function fit!(model::Classifier{PointEstimate}, train_spec::Dict)
         end
         return l / length(train_data_loader)
     end
-
-    @show typeof(train_data_loader)
 
     opt = ADAM(1e-3)
     Flux.@epochs 300 Flux.Optimise.train!(
@@ -111,29 +109,130 @@ function eval(model::Classifier{PointEstimate}, eval_spec::Dict)
 end
 
 
-struct KallistoBootstrap <: QuantMethod end
+struct KallistoBootstrap <: QuantMethod
     ts::Polee.Transcripts
     ts_metadata::Polee.TranscriptsMetadata
     pseudocount::Float32
+    # TODO: parameter giving the maximum number of bootstrap samples to use.
+end
+
+
+function load_kallisto_bootstap(model::Classifier{KallistoBootstrap}, spec::Dict)
+
+    transcript_idx = Dict{String, Int}()
+    for (j, t) in enumerate(model.quant.ts)
+        transcript_idx[t.metadata.name] = j
+    end
+    n = length(transcript_idx)
+
+    expr_data_vecs = Array{Float32, 2}[]
+    class_data_vecs = Flux.OneHotVector[]
+
+    for sample in spec["samples"]
+        filename = sample["kallisto"]
+        @show filename
+        input = h5open(filename)
+
+        transcript_ids = read(input["aux"]["ids"])
+        efflens = read(input["aux"]["eff_lengths"])
+
+        label = sample["factors"][model.factor]
+        label_onehot = Flux.onehot(label, model.classes)
+
+        for dataset in input["bootstrap"]
+            bootstrap_counts = Vector{Float32}(read(dataset))
+            bs = Polee.PoleeModel.kallisto_counts_to_proportions(
+                bootstrap_counts, efflens, model.quant.pseudocount,
+                transcript_ids, transcript_idx)
+            push!(expr_data_vecs, bs)
+            push!(class_data_vecs, label_onehot)
+        end
+
+        close(input)
+    end
+
+    expr_data = Array(transpose(log.(vcat(expr_data_vecs...)))) .- log(1/n)
+    class_data_vecs = hcat(class_data_vecs...)
+
+    return expr_data, class_data_vecs
 end
 
 
 function fit!(model::Classifier{KallistoBootstrap}, train_spec::Dict)
-    # TODO: I think we should use bootstrap samples to simply inflate
-    # the training data, rather than do any kind of normal approximation.
+    model.classes = get_classes(train_spec, model.factor)
+    model.layers = device(build_model(length(model.quant.ts), length(model.classes)))
 
+    train_expr, train_classes = load_kallisto_bootstap(model, train_spec)
+
+    train_data_loader = device.(Flux.Data.DataLoader(
+        train_expr, train_classes,
+        batchsize=50, shuffle=true))
+
+    function total_loss()
+        l = 0f0
+        for (x, y) in train_data_loader
+            l += Flux.Losses.logitcrossentropy(model.layers(x), y)
+        end
+        return l / length(train_data_loader)
+    end
+
+    opt = ADAM(1e-3)
+    Flux.@epochs 300 Flux.Optimise.train!(
+            (x, y) -> Flux.Losses.logitcrossentropy(model.layers(x), y),
+            params(model.layers),
+            train_data_loader,
+            opt,
+            cb=() -> @show total_loss())
 end
 
 
 function eval(model::Classifier{KallistoBootstrap}, eval_spec::Dict)
-    # TODO: Here I think we should take essentially an expectation using
-    # bootstrap samples.
+    transcript_idx = Dict{String, Int}()
+    for (j, t) in enumerate(model.quant.ts)
+        transcript_idx[t.metadata.name] = j
+    end
+    n = length(transcript_idx)
+
+    acc = 0.0
+    for sample in eval_spec["samples"]
+        filename = sample["kallisto"]
+        @show filename
+        input = h5open(filename)
+
+        transcript_ids = read(input["aux"]["ids"])
+        efflens = read(input["aux"]["eff_lengths"])
+
+        label = sample["factors"][model.factor]
+        label_onehot = Flux.onehot(label, model.classes)
+
+        pred = zeros(Float32, length(model.classes))
+        pred_count = 0
+
+        for dataset in input["bootstrap"]
+            bootstrap_counts = Vector{Float32}(read(dataset))
+            bs = Polee.PoleeModel.kallisto_counts_to_proportions(
+                bootstrap_counts, efflens, model.quant.pseudocount,
+                transcript_ids, transcript_idx)
+
+            pred .+= cpu(model.layers(device(log.(bs[1,:]) .- log(1/n))))
+            pred_count += 1
+        end
+        pred ./= pred_count
+        acc += Flux.onecold(pred) .== Flux.onecold(label_onehot)
+        close(input)
+    end
+    acc /= length(eval_spec["samples"])
+
+    return acc
 end
 
 
-# TODO:
-struct PTTLatentExpr         <: QuantMethod end
-struct PTTBetaParams         <: QuantMethod end
+# TODO: Figure out how to set up a sampler as the input to the model. Probably
+# a custom training loop is the easiest way to pull that off.
+struct PTTLatentExpr <: QuantMethod end
+
+# TODO: Do beta-ptt approximation then use vcat(α, β) as the input.
+struct PTTBetaParams <: QuantMethod end
 
 
 end # module PoleeClassifier

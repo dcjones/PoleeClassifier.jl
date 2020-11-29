@@ -5,4 +5,5 @@ version = "0.1.0"
 
 [deps]
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 Polee = "974e64c6-83a9-11e8-1529-590dfc5f6343"

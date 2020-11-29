@@ -2,7 +2,7 @@
 Experiments building RNA-Seq (and perhaps other omics data) classifiers using
 [polee](https://github.com/dcjones/polee) approximate likelihood.
 
-Can we build very efficient uncertainty aware classifiers for cell/type
+Can we build very efficient uncertainty aware classifiers for cell/sample
 type/state using deep learning and the Polya tree transformation? I don't know!
 Tune in to find out!
 
