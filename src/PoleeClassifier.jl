@@ -208,6 +208,100 @@ function eval(model::Classifier{PointEstimate}, eval_spec::Dict, eval_data::Pole
 end
 
 
+function fit_and_monitor!(
+        model::Classifier{PointEstimate},
+        train_spec::Dict, eval_spec::Dict,
+        modelfn::Function, nepochs::Int,
+        output::IO, report_gap::Int=25)
+
+    model.classes = get_classes(train_spec, model.factor)
+    model.layers = device(modelfn(length(model.quant.ts), length(model.classes)))
+
+    # load train data
+    train_data = load_point_estimates_from_specification(
+        train_spec,
+        model.quant.ts,
+        model.quant.ts_metadata,
+        model.quant.point_estimate)
+
+    num_train_samples, n = size(train_data.x0_values)
+    train_expr = expr_trans(Array(transpose(train_data.x0_values)))
+    train_classes = hcat(
+        [Flux.onehot(sample["factors"][model.factor], model.classes)
+         for sample in train_spec["samples"]]...)
+
+    train_data_loader = device.(Flux.Data.DataLoader(
+        train_expr, train_classes,
+        batchsize=batchsize, shuffle=true))
+
+    num_train_samples = size(train_data.x0_values, 1)
+
+    # load eval data
+    eval_data = load_point_estimates_from_specification(
+        eval_spec,
+        model.quant.ts,
+        model.quant.ts_metadata,
+        model.quant.point_estimate)
+
+    eval_expr = expr_trans(Array(transpose(eval_data.x0_values)))
+    eval_classes = hcat(
+        [Flux.onehot(sample["factors"][model.factor], model.classes)
+         for sample in eval_spec["samples"]]...)
+
+    eval_data_loader = Flux.Data.DataLoader(
+        device(eval_expr), eval_classes,
+        batchsize=batchsize)
+
+    num_eval_samples = size(eval_data.x0_values, 1)
+
+    function eval_accuracy()
+        acc = 0.0
+        for (x, y) in eval_data_loader
+            pred = cpu(model.layers(x))
+            acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
+        end
+        acc /= num_eval_samples
+        return acc
+    end
+
+    loss = make_loss(model)
+
+    function total_loss()
+        l = 0f0
+        for (x, y) in train_data_loader
+            l += loss(x, y)
+        end
+        return l / length(train_data_loader)
+    end
+
+    method_name = "point_$(model.quant.point_estimate)"
+
+    opt = ADAM()
+    prog = ProgressMeter.Progress(nepochs, desc="training: ")
+    for epoch in 1:nepochs
+        if (epoch - 1) % report_gap == 0
+            println(
+                output,
+                method_name, ',',
+                epoch - 1, ',',
+                num_train_samples, ',',
+                num_eval_samples, ',',
+                eval_accuracy())
+            flush(output)
+        end
+
+        ps = params(model.layers)
+        for (x, y) in train_data_loader
+            gs = gradient(ps) do
+                return loss(x, y)
+            end
+            Flux.update!(opt, ps, gs)
+        end
+
+        ProgressMeter.next!(prog, showvalues = [(:loss, total_loss())])
+    end
+end
+
 struct KallistoBootstrap <: QuantMethod
     ts::Polee.Transcripts
     ts_metadata::Polee.TranscriptsMetadata
@@ -595,9 +689,10 @@ end
 # Alternative fitting scheme where we just sample a big bunch all at once
 # so we don't have to copy back and forth from the gpu.
 function fit_samples!(
-    model::Classifier{PTTLatentExpr}, train_spec::Dict, nsamples::Int,
+        model::Classifier{PTTLatentExpr}, train_spec::Dict, nsamples::Int,
         modelfn::Function=build_model, nepochs::Int=nepochs)
 
+    model.classes = get_classes(train_spec, model.factor)
     μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
 
     fit_samples!(
@@ -657,12 +752,25 @@ function fit_samples!(
 end
 
 
-function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
+function fit!(
+        model::Classifier{PTTLatentExpr}, train_spec::Dict,
+        modelfn::Function=build_model, nepochs::Int=nepochs)
     # Just going to assume logit-skew-normal approx here. May need
     # to generalize in the future if we start using beta approx.
 
     model.classes = get_classes(train_spec, model.factor)
     μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
+
+    return fit!(model, train_spec, μs, σs, αs, train_classes, modelfn, nepochs)
+end
+
+
+function fit!(
+        model::Classifier{PTTLatentExpr}, train_spec::Dict,
+        μs, σs, αs, train_classes,
+        modelfn::Function=build_model, nepochs::Int=nepochs)
+
+    model.classes = get_classes(train_spec, model.factor)
 
     train_data_loader = Flux.Data.DataLoader(
         μs, σs, αs,
@@ -671,7 +779,7 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
 
     n = size(μs, 1) + 1
     n_out = length(model.classes)
-    model.layers = device(build_model(n, n_out))
+    model.layers = device(modelfn(n, n_out))
 
     sampler = VecApproxLikelihoodSampler(model.quant.t, n, batchsize)
 
@@ -711,6 +819,7 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
     end
 end
 
+
 function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict)
     μs, σs, αs, eval_classes = load_pttlatent_data(model, eval_spec)
     eval(model, eval_spec, μs, σs, αs, eval_classes)
@@ -747,5 +856,94 @@ function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict, μs, σs, αs, 
     return acc
 end
 
+
+function fit_and_monitor!(
+        model::Classifier{PTTLatentExpr},
+        train_spec::Dict, eval_spec::Dict,
+        modelfn::Function, nepochs::Int,
+        output::IO, report_gap::Int=25)
+
+    model.classes = get_classes(train_spec, model.factor)
+    μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
+    num_train_samples = size(μs, 2)
+
+    train_data_loader = Flux.Data.DataLoader(
+        μs, σs, αs,
+        device(train_classes),
+        batchsize=batchsize, shuffle=true)
+
+    n = size(μs, 1) + 1
+    n_out = length(model.classes)
+    model.layers = device(modelfn(n, n_out))
+
+    μs, σs, αs, eval_classes = load_pttlatent_data(model, eval_spec)
+    num_eval_samples = size(μs, 2)
+
+    eval_data_loader = Flux.Data.DataLoader(
+        μs, σs, αs, eval_classes, batchsize=batchsize)
+
+    sampler = VecApproxLikelihoodSampler(model.quant.t, n, batchsize)
+
+    function eval_accuracy()
+        acc = 0.0
+        for (μ, σ, α, y) in eval_data_loader
+            pred = zeros(Float32, length(model.classes), size(μ, 2))
+            for i in 1:model.quant.neval_samples
+
+                x = Array{Float32}(undef, n, size(μ, 2))
+                Polee.rand!(sampler, μ, σ, α, x)
+                x_gpu = expr_trans(device(x))
+                pred .+= Flux.softmax(cpu(model.layers(x_gpu)))
+            end
+            pred ./= model.quant.neval_samples
+
+            acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
+        end
+
+        acc /= num_eval_samples
+        return acc
+    end
+
+    loss = make_loss(model)
+
+    function total_loss()
+        l = 0f0
+        for (μ, σ, α, y) in train_data_loader
+            x = Array{Float32}(undef, n, size(μ, 2))
+            Polee.rand!(sampler, μ, σ, α, x)
+            x_gpu = expr_trans(device(x))
+            l += loss(x_gpu, y)
+        end
+        return l / length(train_data_loader)
+    end
+
+    opt = ADAM()
+    prog = ProgressMeter.Progress(nepochs, desc="training: ")
+    for epoch in 1:nepochs
+        if (epoch - 1) % report_gap == 0
+            println(
+                output,
+                "approx_likelihood", ',',
+                epoch - 1, ',',
+                num_train_samples, ',',
+                num_eval_samples, ',',
+                eval_accuracy())
+            flush(output)
+        end
+
+        ps = params(model.layers)
+        for (μ, σ, α, y) in train_data_loader
+            x = Array{Float32}(undef, n, size(μ, 2))
+            Polee.rand!(sampler, μ, σ, α, x)
+            x_gpu = expr_trans(device(x))
+
+            gs = gradient(ps) do
+                return loss(x_gpu, y)
+            end
+            Flux.update!(opt, ps, gs)
+        end
+        ProgressMeter.next!(prog, showvalues = [(:loss, total_loss())])
+    end
+end
 
 end # module PoleeClassifier
