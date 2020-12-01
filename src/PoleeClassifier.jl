@@ -211,18 +211,14 @@ end
 function fit_and_monitor!(
         model::Classifier{PointEstimate},
         train_spec::Dict, eval_spec::Dict,
+        train_data, eval_data,
         modelfn::Function, nepochs::Int,
         output::IO, report_gap::Int=25)
 
     model.classes = get_classes(train_spec, model.factor)
     model.layers = device(modelfn(length(model.quant.ts), length(model.classes)))
 
-    # load train data
-    train_data = load_point_estimates_from_specification(
-        train_spec,
-        model.quant.ts,
-        model.quant.ts_metadata,
-        model.quant.point_estimate)
+    # train data
 
     num_train_samples, n = size(train_data.x0_values)
     train_expr = expr_trans(Array(transpose(train_data.x0_values)))
@@ -236,12 +232,7 @@ function fit_and_monitor!(
 
     num_train_samples = size(train_data.x0_values, 1)
 
-    # load eval data
-    eval_data = load_point_estimates_from_specification(
-        eval_spec,
-        model.quant.ts,
-        model.quant.ts_metadata,
-        model.quant.point_estimate)
+    # eval data
 
     eval_expr = expr_trans(Array(transpose(eval_data.x0_values)))
     eval_classes = hcat(
@@ -862,27 +853,27 @@ end
 function fit_and_monitor!(
         model::Classifier{PTTLatentExpr},
         train_spec::Dict, eval_spec::Dict,
+        μs_train, σs_train, αs_train, train_classes,
+        μs_eval, σs_eval, αs_eval, eval_classes,
         modelfn::Function, nepochs::Int,
         output::IO, report_gap::Int=25)
 
     model.classes = get_classes(train_spec, model.factor)
-    μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
-    num_train_samples = size(μs, 2)
+    num_train_samples = size(μs_train, 2)
 
     train_data_loader = Flux.Data.DataLoader(
-        μs, σs, αs,
+        μs_train, σs_train, αs_train,
         device(train_classes),
         batchsize=batchsize, shuffle=true)
 
-    n = size(μs, 1) + 1
+    n = size(μs_train, 1) + 1
     n_out = length(model.classes)
     model.layers = device(modelfn(n, n_out))
 
-    μs, σs, αs, eval_classes = load_pttlatent_data(model, eval_spec)
-    num_eval_samples = size(μs, 2)
+    num_eval_samples = size(μs_eval, 2)
 
     eval_data_loader = Flux.Data.DataLoader(
-        μs, σs, αs, eval_classes, batchsize=batchsize)
+        μs_eval, σs_eval, αs_eval, eval_classes, batchsize=batchsize)
 
     sampler = VecApproxLikelihoodSampler(model.quant.t, n, batchsize)
 
