@@ -649,36 +649,38 @@ function Polee.rand!(
         ys[i] = clamp(logistic(sinh(asinh(randn(Float64)) + α[i]) * σ[i] + μ[i]), eps, 1-eps)
     end
 
-    # TODO: we could split up 1:m into batches and multithread this
-
     # polya tree
     us[1,:] .= 1.0
-    k = 1
-    for i in 1:2n-1
-        output_idx = t.index[1, i]
-        if output_idx != 0
-            for j in 1:m
-                x[output_idx, j] = clamp(Float32(us[i, j]), 1f-10, 1 - 1f-10)
+
+    chunks = collect(Iterators.partition(1:m, 8))
+    Threads.@threads for chunk in chunks
+        k = 1
+        for i in 1:2n-1
+            output_idx = t.index[1, i]
+            if output_idx != 0
+                for j in chunk
+                    x[output_idx, j] = clamp(Float32(us[i, j]), 1f-10, 1 - 1f-10)
+                end
+
+                # have to cast, so can't do this
+                # unsafe_copyto!(
+                #     pointer(@view x[output_idx, 1]),
+                #     pointer(@view us[i, 1]), m)
+                continue
             end
 
-            # have to cast, so can't do this
-            # unsafe_copyto!(
-            #     pointer(@view x[output_idx, 1]),
-            #     pointer(@view us[i, 1]), m)
-            continue
+            left_idx = t.index[2, i]
+            right_idx = t.index[3, i]
+
+            # TODO: could use simd and/or threads for this part.
+            for j in chunk
+                v = ys[k,j] * us[i,j]
+                us[left_idx, j] = max(v, eps)
+                us[right_idx, j] = max(us[i,j] - v, eps)
+            end
+
+            k += 1
         end
-
-        left_idx = t.index[2, i]
-        right_idx = t.index[3, i]
-
-        # TODO: could use simd and/or threads for this part.
-        for j in 1:m
-            v = ys[k,j] * us[i,j]
-            us[left_idx, j] = max(v, eps)
-            us[right_idx, j] = max(us[i,j] - v, eps)
-        end
-
-        k += 1
     end
 
     # @show extrema(x)
