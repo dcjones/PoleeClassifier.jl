@@ -14,8 +14,8 @@ const device = Flux.gpu
 const batchsize = 100
 # const nepochs = 1000
 # const nepochs = 25
-const nepochs = 250
-# const nepochs = 500
+# const nepochs = 250
+const nepochs = 500
 
 """
 Generic transformation applid to expression vectors. This seems to make
@@ -25,11 +25,25 @@ training easier.
 
 function clr(x)
     x_log = log.(x)
-    return x_log .- CUDA.mean(x_log)
+    return x_log .- CUDA.mean(x_log, dims=1)
 end
-const expr_trans = clr
 
-sqnorm(ws) = sum(abs2, ws)
+const expr_trans = identity
+# const expr_trans = clr
+# const expr_trans(x) = log.(x)
+
+
+l1(ws) = sum(abs, ws)
+l2(ws) = sum(abs2, ws)
+
+function make_loss(model)
+    # return (x, y) ->
+    #     sum(l2, Flux.params(model.layers)) +
+    #     Flux.Losses.logitcrossentropy(model.layers(x), y)
+    return (x, y) ->
+        Flux.Losses.logitcrossentropy(model.layers(x), y)
+end
+
 
 # Different ways of approaching quantification each with a different take
 # on training the clasifier
@@ -75,21 +89,37 @@ Construct what will be our standard classifier nn given input and output size.
 function build_model(n_in::Int, n_out::Int)
     initW = (dims...) -> 1e-3 * randn(Float32, dims...)
 
-    # M = 50
+    M = 50
     # return Chain(
+    #     # Dropout(0.5, n_in),
     #     Dense(n_in, M, leakyrelu, initW=initW),
-    #     Dropout(0.25, M),
+    #     # Dropout(0.25, M),
     #     Dense(M, M, leakyrelu, initW=initW),
-    #     Dropout(0.25, M),
+    #     # Dropout(0.25, M),
     #     Dense(M, M, leakyrelu, initW=initW),
     #     Dense(M, n_out, initW=initW))
 
+    # TODO: I want the classifier to fit small differences, which I don't think
+    # it's really doing, leading to point estimates being just as good as
+    # 
+
+    return Chain(
+        # Dropout(0.5, n_in),
+        Dense(n_in, M, Flux.elu),
+        # Dropout(0.25, M),
+        Dense(M, M, Flux.elu),
+        # Dropout(0.25, M),
+        Dense(M, M, Flux.elu),
+        Dense(M, n_out))
+
     # logistic regression
-    return Chain(Dense(n_in, n_out, initW=initW))
+    # return Chain(Dense(n_in, n_out, initW=initW))
 end
 
 
-function fit!(model::Classifier{PointEstimate}, train_spec::Dict)
+function fit!(
+        model::Classifier{PointEstimate}, train_spec::Dict,
+        modelfn::Function=build_model, nepochs::Int=nepochs)
 
     train_data = load_point_estimates_from_specification(
         train_spec,
@@ -97,8 +127,16 @@ function fit!(model::Classifier{PointEstimate}, train_spec::Dict)
         model.quant.ts_metadata,
         model.quant.point_estimate)
 
+    fit!(model, train_spec, train_data, modelfn)
+end
+
+function fit!(
+        model::Classifier{PointEstimate}, train_spec::Dict,
+        train_data::Polee.LoadedSamples, modelfn::Function=build_model,
+        nepochs::Int=nepochs)
+
     model.classes = get_classes(train_spec, model.factor)
-    model.layers = device(build_model(length(model.quant.ts), length(model.classes)))
+    model.layers = device(modelfn(length(model.quant.ts), length(model.classes)))
 
     num_samples, n = size(train_data.x0_values)
     train_expr = expr_trans(Array(transpose(train_data.x0_values)))
@@ -118,7 +156,7 @@ function fit!(model::Classifier{PointEstimate}, train_spec::Dict)
         return l / length(train_data_loader)
     end
 
-    loss = (x, y) -> Flux.Losses.logitcrossentropy(model.layers(x), y)
+    loss = make_loss(model)
 
     opt = ADAM()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
@@ -136,13 +174,19 @@ end
 
 
 function eval(model::Classifier{PointEstimate}, eval_spec::Dict)
-    Flux.testmode!(model.layers)
 
     eval_data = load_point_estimates_from_specification(
         eval_spec,
         model.quant.ts,
         model.quant.ts_metadata,
         model.quant.point_estimate)
+
+    return eval(model, eval_spec, eval_data)
+end
+
+
+function eval(model::Classifier{PointEstimate}, eval_spec::Dict, eval_data::Polee.LoadedSamples)
+    Flux.testmode!(model.layers)
 
     num_samples, n = size(eval_data.x0_values)
     eval_expr = expr_trans(Array(transpose(eval_data.x0_values)))
@@ -506,18 +550,21 @@ function Polee.rand!(
     n, m = size(x)
 
     # randn -> sinh-asinh -> logit-normal
+    eps = 1e-10
     Threads.@threads for i in 1:(n-1)*m
-        ys[i] = logistic(sinh(asinh(randn(Float32)) + α[i]) * σ[i] + μ[i])
+        ys[i] = clamp(logistic(sinh(asinh(randn(Float64)) + α[i]) * σ[i] + μ[i]), eps, 1-eps)
     end
 
+    # TODO: we could split up 1:m into batches and multithread this
+
     # polya tree
-    us[1,:] .= 1.0f0
+    us[1,:] .= 1.0
     k = 1
     for i in 1:2n-1
         output_idx = t.index[1, i]
         if output_idx != 0
             for j in 1:m
-                x[output_idx, j] = Float32(us[i, j])
+                x[output_idx, j] = clamp(Float32(us[i, j]), 1f-10, 1 - 1f-10)
             end
 
             # have to cast, so can't do this
@@ -533,14 +580,81 @@ function Polee.rand!(
         # TODO: could use simd and/or threads for this part.
         for j in 1:m
             v = ys[k,j] * us[i,j]
-            us[left_idx, j] = max(v, 1e-16)
-            us[right_idx, j] = max(us[i,j] - v, 1e-16)
+            us[left_idx, j] = max(v, eps)
+            us[right_idx, j] = max(us[i,j] - v, eps)
         end
 
         k += 1
     end
+
+    # @show extrema(x)
 end
 
+
+
+# Alternative fitting scheme where we just sample a big bunch all at once
+# so we don't have to copy back and forth from the gpu.
+function fit_samples!(
+    model::Classifier{PTTLatentExpr}, train_spec::Dict, nsamples::Int,
+        modelfn::Function=build_model, nepochs::Int=nepochs)
+
+    μs, σs, αs, train_classes = load_pttlatent_data(model, train_spec)
+
+    fit_samples!(
+        model, train_spec, μs, σs, αs, train_classes, nsamples,
+        modelfn, nepochs)
+end
+
+
+function fit_samples!(
+        model::Classifier{PTTLatentExpr}, train_spec::Dict,
+        μs, σs, αs, train_classes, nsamples::Int,
+        modelfn::Function=build_model, nepochs::Int=nepochs)
+
+    model.classes = get_classes(train_spec, model.factor)
+
+    # generate data
+    n = size(μs, 1) + 1
+    m = size(μs, 2)
+    sampler = VecApproxLikelihoodSampler(model.quant.t, n, m)
+    expanded_train_expr = Array{Float32}(undef, n, nsamples*m)
+    for i in 1:nsamples
+        Polee.rand!(sampler, μs, σs, αs, @view expanded_train_expr[:,((i-1)*m+1):(i*m)])
+    end
+
+    expanded_train_classes = hcat([train_classes for _ in 1:nsamples]...)
+
+    train_data_loader = device.(Flux.Data.DataLoader(
+        expr_trans(expanded_train_expr), expanded_train_classes,
+        batchsize=batchsize, shuffle=true))
+
+    # train as if we had point estimates
+    n_out = length(model.classes)
+    model.layers = device(modelfn(n, n_out))
+
+    function total_loss()
+        l = 0f0
+        for (x, y) in train_data_loader
+            l += Flux.Losses.logitcrossentropy(model.layers(x), y)
+        end
+        return l / length(train_data_loader)
+    end
+
+    loss = make_loss(model)
+
+    opt = ADAM()
+    prog = ProgressMeter.Progress(nepochs, desc="training: ")
+    for epoch in 1:nepochs
+        ps = params(model.layers)
+        for (x, y) in train_data_loader
+            gs = gradient(ps) do
+                return loss(x, y)
+            end
+            Flux.update!(opt, ps, gs)
+        end
+        ProgressMeter.next!(prog, showvalues = [(:loss, total_loss())])
+    end
+end
 
 
 function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
@@ -574,7 +688,7 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
         return l / length(train_data_loader)
     end
 
-    loss = (x, y) -> Flux.Losses.logitcrossentropy(model.layers(x), y)
+    loss = make_loss(model)
 
     # custom training loop that handles drawing samples
     opt = ADAM()
@@ -597,11 +711,15 @@ function fit!(model::Classifier{PTTLatentExpr}, train_spec::Dict)
     end
 end
 
-
 function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict)
+    μs, σs, αs, eval_classes = load_pttlatent_data(model, eval_spec)
+    eval(model, eval_spec, μs, σs, αs, eval_classes)
+end
+
+
+function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict, μs, σs, αs, eval_classes)
     Flux.testmode!(model.layers)
 
-    μs, σs, αs, eval_classes = load_pttlatent_data(model, eval_spec)
     eval_data_loader = Flux.Data.DataLoader(
         μs, σs, αs, eval_classes, batchsize=batchsize)
 
