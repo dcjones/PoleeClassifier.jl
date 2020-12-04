@@ -4,6 +4,7 @@ module PoleeClassifier
 using Polee
 using Polee.PoleeModel
 using Flux
+import Distributions: Beta, rand
 using HDF5
 import CUDA
 import ProgressMeter
@@ -40,8 +41,13 @@ function make_loss(model)
     # return (x, y) ->
     #     sum(l2, Flux.params(model.layers)) +
     #     Flux.Losses.logitcrossentropy(model.layers(x), y)
+
+    # return (x, y) ->
+    #     Flux.Losses.logitcrossentropy(model.layers(x), y)
+
     return (x, y) ->
-        Flux.Losses.logitcrossentropy(model.layers(x), y)
+        Flux.Losses.logitcrossentropy(model.layers(x), y) +
+        1f1 * sum(l1, model.layers(x)[1])
 end
 
 
@@ -535,6 +541,28 @@ function load_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
 end
 
 
+function load_beta_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
+    α_vecs = Vector{Float32}[]
+    β_vecs = Vector{Float32}[]
+
+    for sample in spec["samples"]
+        input = h5open(sample["file"])
+        push!(α_vecs, read(input["alpha"]))
+        push!(β_vecs, read(input["beta"]))
+        close(input)
+    end
+
+    train_classes = hcat(
+        [Flux.onehot(sample["factors"][model.factor], model.classes)
+         for sample in spec["samples"]]...)
+
+    αs = hcat(α_vecs...)
+    βs = hcat(β_vecs...)
+
+    return αs, βs, train_classes
+end
+
+
 function cuda_approx_sample(t::Polee.PolyaTreeTransform, μ, σ, α)
     n = size(μ, 1) + 1
     m = size(μ, 2)
@@ -599,18 +627,25 @@ end
 # TODO: Let's just do a vectorized and mulithreaded cpu implementation. From
 # there we could probably write a custom cuda version.
 
+
+@enum Approximation begin
+    LogitSkewNormalApprox
+    BetaApprox
+end
+
+
 """
 Approx likelihood sampler operating on multiple samples at once.
 """
-struct VecApproxLikelihoodSampler
+struct VecApproxLikelihoodSampler{T}
     ys::Array{Float64, 2}
     us::Array{Float64, 2}
     t::Polee.PolyaTreeTransform
 end
 
 
-function VecApproxLikelihoodSampler(t::Polee.PolyaTreeTransform, n::Int, m::Int)
-    return VecApproxLikelihoodSampler(
+function VecApproxLikelihoodSampler{T}(t::Polee.PolyaTreeTransform, n::Int, m::Int) where {T}
+    return VecApproxLikelihoodSampler{T}(
         Array{Float64}(undef, n-1, m),
         Array{Float64}(undef, 2*n-1, m),
         t)
@@ -626,7 +661,7 @@ end
 Generate multiple samples from likelihood approximations.
 """
 function Polee.rand!(
-    sampler::VecApproxLikelihoodSampler, μ, σ, α, x)
+    sampler::VecApproxLikelihoodSampler{LogitSkewNormalApprox}, μ, σ, α, x)
 
     ys = sampler.ys
     us = sampler.us
@@ -637,8 +672,35 @@ function Polee.rand!(
     # randn -> sinh-asinh -> logit-normal
     eps = 1e-10
     Threads.@threads for i in 1:(n-1)*m
-        ys[i] = clamp(logistic(sinh(asinh(randn(Float64)) + α[i]) * σ[i] + μ[i]), eps, 1-eps)
+        ys[i] = clamp(logistic(sinh(asinh(randn(Float32)) + α[i]) * σ[i] + μ[i]), eps, 1-eps)
     end
+
+    ptt_transform!(t, x, us, ys)
+end
+
+
+function Polee.rand!(
+    sampler::VecApproxLikelihoodSampler{BetaApprox}, α, β, x)
+
+    ys = sampler.ys
+    us = sampler.us
+    t = sampler.t
+
+    n, m = size(x)
+
+    # rand beta
+    eps = 1e-10
+    Threads.@threads for i in 1:(n-1)*m
+        ys[i] = clamp(rand(Beta(Float64(α[i]), Float64(β[i]))), eps, 1-eps)
+    end
+
+    ptt_transform!(t, x, us, ys)
+end
+
+
+function ptt_transform!(t::Polee.PolyaTreeTransform, x, us, ys)
+    n, m = size(x)
+    eps = 1e-10
 
     # polya tree
     us[1,:] .= 1.0
@@ -673,8 +735,6 @@ function Polee.rand!(
             k += 1
         end
     end
-
-    # @show extrema(x)
 end
 
 
@@ -704,7 +764,7 @@ function fit_samples!(
     # generate data
     n = size(μs, 1) + 1
     m = size(μs, 2)
-    sampler = VecApproxLikelihoodSampler(model.quant.t, n, m)
+    sampler = VecApproxLikelihoodSampler{LogitSkewNormalApprox}(model.quant.t, n, m)
     expanded_train_expr = Array{Float32}(undef, n, nsamples*m)
     for i in 1:nsamples
         Polee.rand!(sampler, μs, σs, αs, @view expanded_train_expr[:,((i-1)*m+1):(i*m)])
@@ -774,7 +834,7 @@ function fit!(
     n_out = length(model.classes)
     model.layers = device(modelfn(n, n_out))
 
-    sampler = VecApproxLikelihoodSampler(model.quant.t, n, batchsize)
+    sampler = VecApproxLikelihoodSampler{LogitSkewNormalApprox}(model.quant.t, n, batchsize)
 
     function total_loss()
         l = 0f0
@@ -827,7 +887,7 @@ function eval(model::Classifier{PTTLatentExpr}, eval_spec::Dict, μs, σs, αs, 
 
     n = size(μs, 1) + 1
     m = size(μs, 2)
-    sampler = VecApproxLikelihoodSampler(model.quant.t, n, batchsize)
+    sampler = VecApproxLikelihoodSampler{LogitSkewNormal}(model.quant.t, n, batchsize)
 
     acc = 0.0
     total_count = 0
@@ -875,7 +935,7 @@ function fit_and_monitor!(
     eval_data_loader = Flux.Data.DataLoader(
         μs_eval, σs_eval, αs_eval, eval_classes, batchsize=batchsize)
 
-    sampler = VecApproxLikelihoodSampler(model.quant.t, n, batchsize)
+    sampler = VecApproxLikelihoodSampler{LogitSkewNormalApprox}(model.quant.t, n, batchsize)
 
     function eval_accuracy()
         acc = 0.0
@@ -934,6 +994,102 @@ function fit_and_monitor!(
         for (μ, σ, α, y) in train_data_loader
             x = Array{Float32}(undef, n, size(μ, 2))
             Polee.rand!(sampler, μ, σ, α, x)
+            x_gpu = expr_trans(device(x))
+
+            gs = gradient(ps) do
+                return loss(x_gpu, y)
+            end
+            Flux.update!(opt, ps, gs)
+        end
+        ProgressMeter.next!(prog, showvalues = [(:loss, last_total_loss)])
+    end
+end
+
+
+function fit_and_monitor_beta!(
+        model::Classifier{PTTLatentExpr},
+        train_spec::Dict, eval_spec::Dict,
+        αs_train, βs_train, train_classes,
+        αs_eval, βs_eval, eval_classes,
+        modelfn::Function, nepochs::Int,
+        output::IO, report_gap::Int=25)
+
+    model.classes = get_classes(train_spec, model.factor)
+    num_train_samples = size(αs_train, 2)
+
+    train_data_loader = Flux.Data.DataLoader(
+        αs_train, βs_train,
+        device(train_classes),
+        batchsize=batchsize, shuffle=true)
+
+    n = size(αs_train, 1) + 1
+    n_out = length(model.classes)
+    model.layers = device(modelfn(n, n_out))
+
+    num_eval_samples = size(αs_eval, 2)
+
+    eval_data_loader = Flux.Data.DataLoader(
+        αs_eval, βs_eval, eval_classes, batchsize=batchsize)
+
+    sampler = VecApproxLikelihoodSampler{BetaApprox}(model.quant.t, n, batchsize)
+
+    function eval_accuracy()
+        acc = 0.0
+        for (α, β, y) in eval_data_loader
+            pred = zeros(Float32, length(model.classes), size(α, 2))
+            for i in 1:model.quant.neval_samples
+
+                x = Array{Float32}(undef, n, size(α, 2))
+                Polee.rand!(sampler, α, β, x)
+                x_gpu = expr_trans(device(x))
+                pred .+= Flux.softmax(cpu(model.layers(x_gpu)))
+            end
+            pred ./= model.quant.neval_samples
+
+            acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
+        end
+
+        acc /= num_eval_samples
+        return acc
+    end
+
+    loss = make_loss(model)
+
+    function total_loss()
+        l = 0f0
+        for (α, β, y) in train_data_loader
+            x = Array{Float32}(undef, n, size(α, 2))
+            Polee.rand!(sampler, α, β, x)
+            x_gpu = expr_trans(device(x))
+            l += loss(x_gpu, y)
+        end
+        return l / length(train_data_loader)
+    end
+
+    opt = ADAM()
+    prog = ProgressMeter.Progress(nepochs, desc="training: ")
+    last_total_loss = Inf
+    for epoch in 1:nepochs
+        # This is expensive, so let's only do it so often
+        if (epoch - 1) % report_gap == 0
+            last_total_loss = total_loss()
+        end
+
+        if (epoch - 1) % report_gap == 0
+            println(
+                output,
+                "approx_likelihood", ',',
+                epoch - 1, ',',
+                num_train_samples, ',',
+                num_eval_samples, ',',
+                eval_accuracy())
+            flush(output)
+        end
+
+        ps = params(model.layers)
+        for (α, β, y) in train_data_loader
+            x = Array{Float32}(undef, n, size(α, 2))
+            Polee.rand!(sampler, α, β, x)
             x_gpu = expr_trans(device(x))
 
             gs = gradient(ps) do
