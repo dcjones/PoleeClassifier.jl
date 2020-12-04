@@ -57,7 +57,7 @@ mutable struct Classifier{T <: QuantMethod}
     quant::T
     layers::Union{Chain, Nothing}
     factor::String
-    classes::Vector{String}
+    classes::Vector
 end
 
 
@@ -75,7 +75,7 @@ end
 Collect an array of unique classes from the specification for the given factor.
 """
 function get_classes(spec::Dict, factor::String)
-    classes = Set{String}()
+    classes = Set()
     for sample in spec["samples"]
         push!(classes, sample["factors"][factor])
     end
@@ -912,7 +912,13 @@ function fit_and_monitor!(
 
     opt = ADAM()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
+    last_total_loss = Inf
     for epoch in 1:nepochs
+        # This is expensive, so let's only do it so often
+        if (epoch - 1) % report_gap == 0
+            last_total_loss = total_loss()
+        end
+
         if (epoch - 1) % report_gap == 0
             println(
                 output,
@@ -935,7 +941,7 @@ function fit_and_monitor!(
             end
             Flux.update!(opt, ps, gs)
         end
-        ProgressMeter.next!(prog, showvalues = [(:loss, total_loss())])
+        ProgressMeter.next!(prog, showvalues = [(:loss, last_total_loss)])
     end
 end
 
