@@ -42,12 +42,12 @@ function make_loss(model)
     #     sum(l2, Flux.params(model.layers)) +
     #     Flux.Losses.logitcrossentropy(model.layers(x), y)
 
-    # return (x, y) ->
-    #     Flux.Losses.logitcrossentropy(model.layers(x), y)
-
     return (x, y) ->
-        Flux.Losses.logitcrossentropy(model.layers(x), y) +
-        1f1 * sum(l1, model.layers(x)[1])
+        Flux.Losses.logitcrossentropy(model.layers(x), y)
+
+    # return (x, y) ->
+    #     Flux.Losses.logitcrossentropy(model.layers(x), y) +
+    #     1f1 * sum(l1, model.layers(x)[1])
 end
 
 
@@ -520,12 +520,14 @@ function load_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
     μ_vecs = Vector{Float32}[]
     σ_vecs = Vector{Float32}[]
     α_vecs = Vector{Float32}[]
+    el_vecs = Vector{Float32}[]
 
     for sample in spec["samples"]
         input = h5open(sample["file"])
         push!(μ_vecs, read(input["mu"]))
         push!(σ_vecs, exp.(read(input["omega"])))
         push!(α_vecs, read(input["alpha"]))
+        push!(el_vecs, read(input["effective_lengths"]))
         close(input)
     end
 
@@ -536,19 +538,22 @@ function load_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
     μs = hcat(μ_vecs...)
     σs = hcat(σ_vecs...)
     αs = hcat(α_vecs...)
+    els = hcat(el_vecs...)
 
-    return μs, σs, αs, train_classes
+    return μs, σs, αs, els, train_classes
 end
 
 
 function load_beta_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
     α_vecs = Vector{Float32}[]
     β_vecs = Vector{Float32}[]
+    el_vecs = Vector{Float32}[]
 
     for sample in spec["samples"]
         input = h5open(sample["file"])
         push!(α_vecs, read(input["alpha"]))
         push!(β_vecs, read(input["beta"]))
+        push!(el_vecs, read(input["effective_lengths"]))
         close(input)
     end
 
@@ -558,8 +563,9 @@ function load_beta_pttlatent_data(model::Classifier{PTTLatentExpr}, spec::Dict)
 
     αs = hcat(α_vecs...)
     βs = hcat(β_vecs...)
+    els = hcat(el_vecs...)
 
-    return αs, βs, train_classes
+    return αs, βs, els, train_classes
 end
 
 
@@ -661,7 +667,7 @@ end
 Generate multiple samples from likelihood approximations.
 """
 function Polee.rand!(
-    sampler::VecApproxLikelihoodSampler{LogitSkewNormalApprox}, μ, σ, α, x)
+    sampler::VecApproxLikelihoodSampler{LogitSkewNormalApprox}, μ, σ, α, els, x)
 
     ys = sampler.ys
     us = sampler.us
@@ -670,17 +676,17 @@ function Polee.rand!(
     n, m = size(x)
 
     # randn -> sinh-asinh -> logit-normal
-    eps = 1e-10
+    eps = 1e-14
     Threads.@threads for i in 1:(n-1)*m
         ys[i] = clamp(logistic(sinh(asinh(randn(Float32)) + α[i]) * σ[i] + μ[i]), eps, 1-eps)
     end
 
-    ptt_transform!(t, x, us, ys)
+    ptt_transform!(t, x, us, ys, els)
 end
 
 
 function Polee.rand!(
-    sampler::VecApproxLikelihoodSampler{BetaApprox}, α, β, x)
+    sampler::VecApproxLikelihoodSampler{BetaApprox}, α, β, els, x)
 
     ys = sampler.ys
     us = sampler.us
@@ -689,18 +695,19 @@ function Polee.rand!(
     n, m = size(x)
 
     # rand beta
-    eps = 1e-10
+    eps = 1e-14
     Threads.@threads for i in 1:(n-1)*m
         ys[i] = clamp(rand(Beta(Float64(α[i]), Float64(β[i]))), eps, 1-eps)
     end
 
-    ptt_transform!(t, x, us, ys)
+    ptt_transform!(t, x, us, ys, els)
 end
 
 
-function ptt_transform!(t::Polee.PolyaTreeTransform, x, us, ys)
+function ptt_transform!(t::Polee.PolyaTreeTransform, x, us, ys, els)
     n, m = size(x)
-    eps = 1e-10
+    eps = 1e-14
+    epsf = 1f-14
 
     # polya tree
     us[1,:] .= 1.0
@@ -712,7 +719,7 @@ function ptt_transform!(t::Polee.PolyaTreeTransform, x, us, ys)
             output_idx = t.index[1, i]
             if output_idx != 0
                 for j in chunk
-                    x[output_idx, j] = clamp(Float32(us[i, j]), 1f-10, 1 - 1f-10)
+                    x[output_idx, j] = clamp(Float32(us[i, j]), epsf, 1f0 - epsf)
                 end
 
                 # have to cast, so can't do this
@@ -735,6 +742,10 @@ function ptt_transform!(t::Polee.PolyaTreeTransform, x, us, ys)
             k += 1
         end
     end
+
+    # effective length transformation
+    x ./= els
+    x ./= sum(x, dims=1)
 end
 
 
@@ -913,8 +924,8 @@ end
 function fit_and_monitor!(
         model::Classifier{PTTLatentExpr},
         train_spec::Dict, eval_spec::Dict,
-        μs_train, σs_train, αs_train, train_classes,
-        μs_eval, σs_eval, αs_eval, eval_classes,
+        μs_train, σs_train, αs_train, els_train, train_classes,
+        μs_eval, σs_eval, αs_eval, els_eval, eval_classes,
         modelfn::Function, nepochs::Int,
         output::IO, report_gap::Int=25)
 
@@ -922,7 +933,7 @@ function fit_and_monitor!(
     num_train_samples = size(μs_train, 2)
 
     train_data_loader = Flux.Data.DataLoader(
-        μs_train, σs_train, αs_train,
+        μs_train, σs_train, αs_train, els_train,
         device(train_classes),
         batchsize=batchsize, shuffle=true)
 
@@ -933,18 +944,18 @@ function fit_and_monitor!(
     num_eval_samples = size(μs_eval, 2)
 
     eval_data_loader = Flux.Data.DataLoader(
-        μs_eval, σs_eval, αs_eval, eval_classes, batchsize=batchsize)
+        μs_eval, σs_eval, αs_eval, els_eval, eval_classes, batchsize=batchsize)
 
     sampler = VecApproxLikelihoodSampler{LogitSkewNormalApprox}(model.quant.t, n, batchsize)
 
     function eval_accuracy()
         acc = 0.0
-        for (μ, σ, α, y) in eval_data_loader
+        for (μ, σ, α, el, y) in eval_data_loader
             pred = zeros(Float32, length(model.classes), size(μ, 2))
             for i in 1:model.quant.neval_samples
 
                 x = Array{Float32}(undef, n, size(μ, 2))
-                Polee.rand!(sampler, μ, σ, α, x)
+                Polee.rand!(sampler, μ, σ, α, el, x)
                 x_gpu = expr_trans(device(x))
                 pred .+= Flux.softmax(cpu(model.layers(x_gpu)))
             end
@@ -961,16 +972,16 @@ function fit_and_monitor!(
 
     function total_loss()
         l = 0f0
-        for (μ, σ, α, y) in train_data_loader
+        for (μ, σ, α, el, y) in train_data_loader
             x = Array{Float32}(undef, n, size(μ, 2))
-            Polee.rand!(sampler, μ, σ, α, x)
+            Polee.rand!(sampler, μ, σ, α, el, x)
             x_gpu = expr_trans(device(x))
             l += loss(x_gpu, y)
         end
         return l / length(train_data_loader)
     end
 
-    opt = ADAM()
+    opt = ADAM(1e-2, (0.9, 0.99))
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     last_total_loss = Inf
     for epoch in 1:nepochs
@@ -991,9 +1002,9 @@ function fit_and_monitor!(
         end
 
         ps = params(model.layers)
-        for (μ, σ, α, y) in train_data_loader
+        for (μ, σ, α, el, y) in train_data_loader
             x = Array{Float32}(undef, n, size(μ, 2))
-            Polee.rand!(sampler, μ, σ, α, x)
+            Polee.rand!(sampler, μ, σ, α, el, x)
             x_gpu = expr_trans(device(x))
 
             gs = gradient(ps) do
@@ -1009,8 +1020,8 @@ end
 function fit_and_monitor_beta!(
         model::Classifier{PTTLatentExpr},
         train_spec::Dict, eval_spec::Dict,
-        αs_train, βs_train, train_classes,
-        αs_eval, βs_eval, eval_classes,
+        αs_train, βs_train, els_train, train_classes,
+        αs_eval, βs_eval, els_eval, eval_classes,
         modelfn::Function, nepochs::Int,
         output::IO, report_gap::Int=25)
 
@@ -1018,7 +1029,7 @@ function fit_and_monitor_beta!(
     num_train_samples = size(αs_train, 2)
 
     train_data_loader = Flux.Data.DataLoader(
-        αs_train, βs_train,
+        αs_train, βs_train, els_train,
         device(train_classes),
         batchsize=batchsize, shuffle=true)
 
@@ -1029,18 +1040,18 @@ function fit_and_monitor_beta!(
     num_eval_samples = size(αs_eval, 2)
 
     eval_data_loader = Flux.Data.DataLoader(
-        αs_eval, βs_eval, eval_classes, batchsize=batchsize)
+        αs_eval, βs_eval, els_eval, eval_classes, batchsize=batchsize)
 
     sampler = VecApproxLikelihoodSampler{BetaApprox}(model.quant.t, n, batchsize)
 
     function eval_accuracy()
         acc = 0.0
-        for (α, β, y) in eval_data_loader
+        for (α, β, el, y) in eval_data_loader
             pred = zeros(Float32, length(model.classes), size(α, 2))
             for i in 1:model.quant.neval_samples
 
                 x = Array{Float32}(undef, n, size(α, 2))
-                Polee.rand!(sampler, α, β, x)
+                Polee.rand!(sampler, α, β, el, x)
                 x_gpu = expr_trans(device(x))
                 pred .+= Flux.softmax(cpu(model.layers(x_gpu)))
             end
@@ -1057,16 +1068,18 @@ function fit_and_monitor_beta!(
 
     function total_loss()
         l = 0f0
-        for (α, β, y) in train_data_loader
+        for (α, β, el, y) in train_data_loader
             x = Array{Float32}(undef, n, size(α, 2))
-            Polee.rand!(sampler, α, β, x)
+            Polee.rand!(sampler, α, β, el, x)
             x_gpu = expr_trans(device(x))
             l += loss(x_gpu, y)
         end
         return l / length(train_data_loader)
     end
 
-    opt = ADAM()
+    # opt = ADAM()
+    # opt = ADAM(1e-3, (0.99, 0.999))
+    opt = ADAM(1e-2, (0.9, 0.99))
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     last_total_loss = Inf
     for epoch in 1:nepochs
@@ -1087,9 +1100,9 @@ function fit_and_monitor_beta!(
         end
 
         ps = params(model.layers)
-        for (α, β, y) in train_data_loader
+        for (α, β, el, y) in train_data_loader
             x = Array{Float32}(undef, n, size(α, 2))
-            Polee.rand!(sampler, α, β, x)
+            Polee.rand!(sampler, α, β, el, x)
             x_gpu = expr_trans(device(x))
 
             gs = gradient(ps) do
