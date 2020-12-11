@@ -4,10 +4,16 @@ module PoleeClassifier
 using Polee
 using Polee.PoleeModel
 using Flux
+using DelimitedFiles
+using LinearAlgebra
+using SIMD
 import Distributions: Beta, rand
 using HDF5
 import CUDA
 import ProgressMeter
+import Zygote
+
+include("distance.jl")
 
 const device = Flux.gpu
 # const device = Flux.cpu
@@ -29,7 +35,8 @@ function clr(x)
     return x_log .- CUDA.mean(x_log, dims=1)
 end
 
-const expr_trans = identity
+# const expr_trans = identity
+const expr_trans(x) = log.(1f0 .+ 1f6.*x)
 # const expr_trans = clr
 # const expr_trans(x) = log.(x)
 
@@ -42,12 +49,17 @@ function make_loss(model)
     #     sum(l2, Flux.params(model.layers)) +
     #     Flux.Losses.logitcrossentropy(model.layers(x), y)
 
-    return (x, y) ->
-        Flux.Losses.logitcrossentropy(model.layers(x), y)
-
     # return (x, y) ->
-    #     Flux.Losses.logitcrossentropy(model.layers(x), y) +
-    #     1f1 * sum(l1, model.layers(x)[1])
+    #     Flux.Losses.logitcrossentropy(model.layers(x), y)
+
+    return (x, y) ->
+        Flux.Losses.logitcrossentropy(model.layers(x), y) +
+        10f0 * sum(l2, model.layers(x)[1])
+end
+
+
+function make_optimizer()
+    return Flux.Optimiser(ExpDecay(1.0, 0.995, 1), ADAM())
 end
 
 
@@ -127,6 +139,7 @@ function fit!(
         model::Classifier{PointEstimate}, train_spec::Dict,
         modelfn::Function=build_model, nepochs::Int=nepochs)
 
+    # TODO: can I do this without needing transcripts?
     train_data = load_point_estimates_from_specification(
         train_spec,
         model.quant.ts,
@@ -164,7 +177,7 @@ function fit!(
 
     loss = make_loss(model)
 
-    opt = ADAM()
+    opt = make_optimizer()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     for epoch in 1:nepochs
         ps = params(model.layers)
@@ -252,11 +265,13 @@ function fit_and_monitor!(
     num_eval_samples = size(eval_data.x0_values, 1)
 
     function eval_accuracy()
+        Flux.testmode!(model.layers)
         acc = 0.0
         for (x, y) in eval_data_loader
             pred = cpu(model.layers(x))
             acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
         end
+        Flux.trainmode!(model.layers)
         acc /= num_eval_samples
         return acc
     end
@@ -273,7 +288,7 @@ function fit_and_monitor!(
 
     method_name = "point_$(model.quant.point_estimate)"
 
-    opt = ADAM()
+    opt = make_optimizer()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     for epoch in 1:nepochs
         if (epoch - 1) % report_gap == 0
@@ -371,7 +386,7 @@ function fit!(model::Classifier{KallistoBootstrap}, train_spec::Dict)
         return l / length(train_data_loader)
     end
 
-    opt = ADAM()
+    opt = make_optimizer()
     Flux.@epochs nepochs Flux.Optimise.train!(
             (x, y) -> Flux.Losses.logitcrossentropy(model.layers(x), y),
             params(model.layers),
@@ -473,7 +488,7 @@ function fit!(model::Classifier{PTTBetaParams}, train_spec::Dict)
         return l / length(train_data_loader)
     end
 
-    opt = ADAM()
+    opt = make_optimizer()
     Flux.@epochs nepochs Flux.Optimise.train!(
             (x, y) -> Flux.Losses.logitcrossentropy(model.layers(x), y),
             params(model.layers),
@@ -673,7 +688,8 @@ function Polee.rand!(
     us = sampler.us
     t = sampler.t
 
-    n, m = size(x)
+    n = size(μ, 1) + 1
+    m = size(μ, 2)
 
     # randn -> sinh-asinh -> logit-normal
     eps = 1e-14
@@ -801,7 +817,7 @@ function fit_samples!(
 
     loss = make_loss(model)
 
-    opt = ADAM()
+    opt = make_optimizer()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     for epoch in 1:nepochs
         ps = params(model.layers)
@@ -863,7 +879,7 @@ function fit!(
     loss = make_loss(model)
 
     # custom training loop that handles drawing samples
-    opt = ADAM()
+    opt = make_optimizer()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     for epoch in 1:nepochs
         ps = params(model.layers)
@@ -949,6 +965,7 @@ function fit_and_monitor!(
     sampler = VecApproxLikelihoodSampler{LogitSkewNormalApprox}(model.quant.t, n, batchsize)
 
     function eval_accuracy()
+        Flux.testmode!(model.layers)
         acc = 0.0
         for (μ, σ, α, el, y) in eval_data_loader
             pred = zeros(Float32, length(model.classes), size(μ, 2))
@@ -963,6 +980,7 @@ function fit_and_monitor!(
 
             acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
         end
+        Flux.trainmode!(model.layers)
 
         acc /= num_eval_samples
         return acc
@@ -981,9 +999,10 @@ function fit_and_monitor!(
         return l / length(train_data_loader)
     end
 
-    opt = ADAM(1e-2, (0.9, 0.99))
+    opt = make_optimizer()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     last_total_loss = Inf
+    n_grad_samples = 3
     for epoch in 1:nepochs
         # This is expensive, so let's only do it so often
         if (epoch - 1) % report_gap == 0
@@ -1004,12 +1023,25 @@ function fit_and_monitor!(
         ps = params(model.layers)
         for (μ, σ, α, el, y) in train_data_loader
             x = Array{Float32}(undef, n, size(μ, 2))
-            Polee.rand!(sampler, μ, σ, α, el, x)
-            x_gpu = expr_trans(device(x))
+            # Polee.rand!(sampler, μ, σ, α, el, x)
+            # x_gpu = expr_trans(device(x))
 
             gs = gradient(ps) do
-                return loss(x_gpu, y)
+                mean_loss = 0.f0
+                for i in 1:n_grad_samples
+                    x_gpu = Zygote.ignore() do
+                        Polee.rand!(sampler, μ, σ, α, el, x)
+                        return expr_trans(device(x))
+                    end
+                    mean_loss += loss(x_gpu, y)
+                end
+                mean_loss /= n_grad_samples
             end
+
+            # gs = gradient(ps) do
+            #     return loss(x_gpu, y)
+            # end
+
             Flux.update!(opt, ps, gs)
         end
         ProgressMeter.next!(prog, showvalues = [(:loss, last_total_loss)])
@@ -1045,6 +1077,7 @@ function fit_and_monitor_beta!(
     sampler = VecApproxLikelihoodSampler{BetaApprox}(model.quant.t, n, batchsize)
 
     function eval_accuracy()
+        Flux.testmode!(model.layers)
         acc = 0.0
         for (α, β, el, y) in eval_data_loader
             pred = zeros(Float32, length(model.classes), size(α, 2))
@@ -1059,6 +1092,7 @@ function fit_and_monitor_beta!(
 
             acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
         end
+        Flux.trainmode!(model.layers)
 
         acc /= num_eval_samples
         return acc
@@ -1077,9 +1111,7 @@ function fit_and_monitor_beta!(
         return l / length(train_data_loader)
     end
 
-    # opt = ADAM()
-    # opt = ADAM(1e-3, (0.99, 0.999))
-    opt = ADAM(1e-2, (0.9, 0.99))
+    opt = make_optimizer()
     prog = ProgressMeter.Progress(nepochs, desc="training: ")
     last_total_loss = Inf
     for epoch in 1:nepochs
@@ -1107,6 +1139,108 @@ function fit_and_monitor_beta!(
 
             gs = gradient(ps) do
                 return loss(x_gpu, y)
+            end
+            Flux.update!(opt, ps, gs)
+        end
+        ProgressMeter.next!(prog, showvalues = [(:loss, last_total_loss)])
+    end
+end
+
+
+function fit_and_monitor_splits!(
+        model::Classifier{PTTLatentExpr},
+        train_spec::Dict, eval_spec::Dict,
+        μs_train, σs_train, αs_train, els_train, train_classes,
+        μs_eval, σs_eval, αs_eval, els_eval, eval_classes,
+        modelfn::Function, nepochs::Int,
+        output::IO, report_gap::Int=25)
+
+    model.classes = get_classes(train_spec, model.factor)
+    num_train_samples = size(μs_train, 2)
+
+    train_data_loader = Flux.Data.DataLoader(
+        μs_train, σs_train, αs_train, els_train,
+        device(train_classes),
+        batchsize=batchsize, shuffle=true)
+
+    n = size(μs_train, 1) + 1
+    n_out = length(model.classes)
+    model.layers = device(modelfn(n-1, n_out))
+
+    num_eval_samples = size(μs_eval, 2)
+
+    eval_data_loader = Flux.Data.DataLoader(
+        μs_eval, σs_eval, αs_eval, els_eval, eval_classes, batchsize=batchsize)
+
+    function sample_ys!(ys, μ, σ, α)
+        nm1, m = size(ys)
+        eps = 1e-14
+        Threads.@threads for i in 1:nm1*m
+            ys[i] = clamp(logistic(sinh(asinh(randn(Float32)) + α[i]) * σ[i] + μ[i]), eps, 1-eps)
+        end
+    end
+
+    function eval_accuracy()
+        acc = 0.0
+        for (μ, σ, α, el, y) in eval_data_loader
+            pred = zeros(Float32, length(model.classes), size(μ, 2))
+            for i in 1:model.quant.neval_samples
+                u = Array{Float32}(undef, n-1, size(μ, 2))
+                sample_ys!(u, μ, σ, α)
+                u_gpu = device(u)
+                pred .+= Flux.softmax(cpu(model.layers(u_gpu)))
+            end
+            pred ./= model.quant.neval_samples
+
+            acc += sum(Flux.onecold(pred) .== Flux.onecold(y))
+        end
+
+        acc /= num_eval_samples
+        return acc
+    end
+
+    loss = make_loss(model)
+
+    function total_loss()
+        l = 0f0
+        for (μ, σ, α, el, y) in train_data_loader
+            u = Array{Float32}(undef, n-1, size(μ, 2))
+            sample_ys!(u, μ, σ, α)
+            u_gpu = device(u)
+            l += loss(u_gpu, y)
+        end
+        return l / length(train_data_loader)
+    end
+
+    opt = make_optimizer()
+    prog = ProgressMeter.Progress(nepochs, desc="training: ")
+    last_total_loss = Inf
+    for epoch in 1:nepochs
+        # This is expensive, so let's only do it so often
+        if (epoch - 1) % report_gap == 0
+            last_total_loss = total_loss()
+        end
+
+        if (epoch - 1) % report_gap == 0
+            println(
+                output,
+                "approx_likelihood", ',',
+                epoch - 1, ',',
+                num_train_samples, ',',
+                num_eval_samples, ',',
+                eval_accuracy())
+            flush(output)
+        end
+
+        ps = params(model.layers)
+        for (μ, σ, α, el, y) in train_data_loader
+            u = Array{Float32}(undef, n-1, size(μ, 2))
+            sample_ys!(u, μ, σ, α)
+            @show extrema(u)
+            u_gpu = device(u)
+
+            gs = gradient(ps) do
+                return loss(u_gpu, y)
             end
             Flux.update!(opt, ps, gs)
         end
