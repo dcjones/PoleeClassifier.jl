@@ -56,7 +56,7 @@ def inverse_ptt_params(left_index, right_index, leaf_index):
             continue
         max_leaf[k] = max_leaf_index[i] + 1
         min_leaf[k] = min_leaf_index[i]
-        left_max_leaf[k] = max_leaf_index[left_index[i]]
+        left_max_leaf[k] = max_leaf_index[left_index[i]] + 1
         k += 1
 
     return PttArgs(
@@ -75,22 +75,31 @@ by computing cumsum over leaf nodes, then subtracting to get subtree sums.
 
 xs is assumed to have shape [batch_dim, n]
 """
-def inverse_ptt(pttargs, xs):
-    nbatch = xs.shape[0]
+def inverse_ptt(pttargs, x):
+    nbatch = x.shape[0]
 
-    xs_perm = xs[:,pttargs.leaf_permutation]
+    x_perm = x[:,pttargs.leaf_permutation]
 
-    xs_perm_cumsum = jnp.cumsum(xs_perm, dtype=jnp.float64, axis=-1)
-    xs_perm_cumsum -= xs_perm
-    cs = jnp.hstack([xs_perm_cumsum, jnp.ones((nbatch,1))])
+    x_perm_cumsum = jnp.cumsum(x_perm, dtype=jnp.float64, axis=-1)
+    x_perm_cumsum -= x_perm
+    cs = jnp.hstack([x_perm_cumsum, jnp.ones((nbatch,1))])
 
     cs_subtree_min = cs[:,pttargs.min_leaf]
     u_left = jnp.float32(cs[:,pttargs.left_max_leaf] - cs_subtree_min)
     u = jnp.float32(cs[:,pttargs.max_leaf] - cs_subtree_min)
+    # u_left = cs[:,pttargs.left_max_leaf] - cs_subtree_min
+    # u = cs[:,pttargs.max_leaf] - cs_subtree_min
     y = u_left / u
-    ladj = jnp.sum(u)
+    ladj = jnp.sum(jnp.log(u), axis=-1)
 
     return y, ladj
+
+
+def approx_log_likelihood(pttargs, α, β, x):
+    y, ladj = inverse_ptt(pttargs, x)
+    ll = jnp.sum((α - 1.0) * jnp.log(y) + (β - 1.0) * jnp.log(1.0 - y), axis=-1)
+    ll += ladj
+    return ll
 
 
 def load_likap_data(spec):
@@ -148,15 +157,19 @@ if __name__ == "__main__":
     n = α.shape[-1] + 1
 
     # make some fake data
-    xs = np.exp(np.float32(np.random.randn(100, n)))
-    xs = xs / np.sum(xs, axis=-1, keepdims=True)
-    xs = jax.device_put(xs)
+    x = np.exp(np.float32(np.random.randn(100, n)))
+    x = x / np.sum(x, axis=-1, keepdims=True)
+    x = jax.device_put(x)
 
     inverse_ptt_jit = jax.jit(inverse_ptt)
+    approx_log_likelihood_jit = jax.jit(approx_log_likelihood)
+
+    # ll = approx_log_likelihood(pttargs, α, β, x)
+    # print(ll)
 
     def run():
-        ys, ladj = inverse_ptt(pttargs, xs)
-        ys.block_until_ready()
+        ll = approx_log_likelihood_jit(pttargs, α, β, x)
+        ll.block_until_ready()
 
     print(timeit.timeit(run, number=10))
 
